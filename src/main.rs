@@ -22,7 +22,10 @@ const CPU6_ONLINE: &str = "/sys/devices/system/cpu/cpu6/online";
 const BACKLIGHT_PATH: &str = "/sys/class/thermal/thermal_message/thermal_max_brightness";
 const TEMP_STATE_PATH: &str = "/sys/class/thermal/thermal_message/temp_state";
 const WIFI_LIMIT_PATH: &str = "/sys/class/thermal/thermal_message/wifi_limit";
-const BOOST_LIMIT_PATH: &str = "/sys/module/cpu_boost/parameters/input_boost_enabled";
+
+// ── WALT Input Boost paths ──────────────────────────────────────────────────
+const WALT_BOOST_FREQ_PATH: &str = "/proc/sys/walt/input_boost/input_boost_freq";
+const WALT_BOOST_MS_PATH: &str = "/proc/sys/walt/input_boost/input_boost_ms";
 
 // ── Charging control paths ──────────────────────────────────────────────────
 const CHARGE_LIMIT_NODE: &str = "/sys/class/power_supply/battery/charge_control_limit";
@@ -57,6 +60,16 @@ const GPU_TARGET_INDICES: [usize; 3] = [2, 4, 5];
 const TSTATE_TRIG: [i32; 4] = [46000, 48000, 51000, 53000];
 const TSTATE_CLR: [i32; 4] = [44000, 46000, 50000, 51000];
 const TSTATE_TARGET: [i32; 4] = [110100000, 110100004, 112300001, 112520001];
+
+// ── WALT String Configurations ──────────────────────────────────────────────
+const BOOST_ENABLED_STR: &str = "1516800 0 0 0 1344000 0 0 0";
+const BOOST_DISABLED_STR: &str = "0 0 0 0 0 0 0 0";
+
+// ── Predictive control constants ──────────────────────────────────────────
+const THERMAL_SPIKE_THRESHOLD: i32 = 1500; // 1.5°C per 2s interval
+const PROACTIVE_CPU_TEMP_BOOST: i32 = 3000; // 3°C offset for throttling
+const PROACTIVE_BOOST_TEMP_THRESHOLD: i32 = 42000; // 42°C
+const PROACTIVE_CHG_TEMP_THRESHOLD: i32 = 35000; // 35°C
 
 // ── High-Performance I/O Wrapper ────────────────────────────────────────────
 struct SysfsNode {
@@ -96,21 +109,31 @@ impl SysfsNode {
             eprintln!("Failed to seek {}: {}", self.path, e);
             return;
         }
-        if let Err(e) = self.file.set_len(0) {
-            eprintln!("Failed to truncate {}: {}", self.path, e);
-            return;
-        }
-        let val_str = format!("{}\n", value);
+        let _ = self.file.set_len(0);
+        
+        let val_str = format!("{}\n", value); 
         if let Err(e) = self.file.write_all(val_str.as_bytes()) {
             eprintln!("Failed to write {} to {}: {}", value, self.path, e);
         }
-        if let Err(e) = self.file.sync_all() {
-            eprintln!("Failed to sync {}: {}", self.path, e);
+        let _ = self.file.sync_all();
+    }
+
+    fn write_str(&mut self, value: &str) {
+        if let Err(e) = self.file.seek(SeekFrom::Start(0)) {
+            eprintln!("Failed to seek {}: {}", self.path, e);
+            return;
         }
+        let _ = self.file.set_len(0); 
+        
+        let val_str = format!("{}\n", value); 
+        if let Err(e) = self.file.write_all(val_str.as_bytes()) {
+            eprintln!("Failed to write string to {}: {}", self.path, e);
+        }
+        let _ = self.file.sync_all();
     }
 }
 
-// ── Helper for optional writes ─────────────────────────────────────────────
+// ── Helpers for optional writes ────────────────────────────────────────────
 macro_rules! write_opt {
     ($node:expr, $value:expr) => {
         if let Some(n) = &mut $node {
@@ -119,11 +142,19 @@ macro_rules! write_opt {
     };
 }
 
+macro_rules! write_str_opt {
+    ($node:expr, $value:expr) => {
+        if let Some(n) = &mut $node {
+            n.write_str($value);
+        }
+    };
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 fn main() {
     println!("============================================================");
     println!(" Unified Thermal & Charging Daemon (Rust)");
-    println!(" ML-Optimized weights | Proactive I/O Cached Mode");
+    println!(" ML-Optimized weights | Proactive Rate-of-Change Control");
     println!("============================================================");
 
     // Initialise cached sensor nodes
@@ -145,23 +176,31 @@ fn main() {
     let mut node_backlight = SysfsNode::new(BACKLIGHT_PATH, false);
     let mut node_tstate = SysfsNode::new(TEMP_STATE_PATH, false);
     let mut node_wifi = SysfsNode::new(WIFI_LIMIT_PATH, false);
-    let mut node_boost = SysfsNode::new(BOOST_LIMIT_PATH, false);
     let mut node_chg_limit = SysfsNode::new(CHARGE_LIMIT_NODE, false);
     let mut node_res_chg = SysfsNode::new(RESTRICT_CHG_NODE, false);
     let mut node_res_cur = SysfsNode::new(RESTRICT_CUR_NODE, false);
+    
+    // Initialise WALT nodes
+    let mut node_walt_boost = SysfsNode::new(WALT_BOOST_FREQ_PATH, false);
+    let mut node_walt_ms = SysfsNode::new(WALT_BOOST_MS_PATH, false);
 
     // Initial charging state
     write_opt!(node_res_chg, 0);
     write_opt!(node_res_cur, 1000000);
+    
+    // Initial WALT state
+    write_str_opt!(node_walt_ms, "80");
+    write_str_opt!(node_walt_boost, BOOST_ENABLED_STR);
 
     // State tracking
+    let mut prev_virtual_temp: Option<i32> = None;
     let mut state_cpu0: usize = 0;
     let mut state_cpu4: usize = 0;
     let mut state_gpu: usize = 0;
     let mut state_tstate: usize = 0;
     let mut state_backlight: i32 = 255;
     let mut state_wifi: i32 = 0;
-    let mut state_boost: i32 = 0;
+    let mut state_boost: i32 = 1;
     let mut state_ccc_hotplug: bool = false;
     let mut state_bcl_hotplug: bool = false;
 
@@ -190,17 +229,40 @@ fn main() {
         let virtual_c = virtual_temp / 1000;
         let batt_temp = t_battery / 1000;
 
-        // ── CPU0 ──────────────────────────────────────────────────────────
+        // ── Calculate thermal derivative (Rate of Change) ───────────────
+        let temp_delta = match prev_virtual_temp {
+            Some(prev) => virtual_temp - prev,
+            None => 0,
+        };
+        prev_virtual_temp = Some(virtual_temp);
+
+        let is_thermal_spike = temp_delta >= THERMAL_SPIKE_THRESHOLD;
+
+        if is_thermal_spike {
+            println!(
+                "[PROACTIVE] Rapid thermal rise detected! Delta: +{:.1}°C/2s",
+                temp_delta as f32 / 1000.0
+            );
+        }
+
+        // ── Apply proactive offset for CPU throttling ──────────────────
+        let virtual_temp_for_cpu = if is_thermal_spike && virtual_temp >= 35000 {
+            virtual_temp + PROACTIVE_CPU_TEMP_BOOST
+        } else {
+            virtual_temp
+        };
+
+        // ── CPU0 (with proactive offset) ────────────────────────────────
         for i in (0..4).rev() {
-            if virtual_temp >= CPU0_TRIG[i] && state_cpu0 <= i {
+            if virtual_temp_for_cpu >= CPU0_TRIG[i] && state_cpu0 <= i {
                 state_cpu0 = i + 1;
-                println!("[CPU0] Up -> L{} ({}Hz)", state_cpu0, CPU0_TARGET[i]);
+                println!("[CPU0] Up -> L{} ({}Hz) [Proactive]", state_cpu0, CPU0_TARGET[i]);
                 write_opt!(node_cpu0, CPU0_TARGET[i]);
                 break;
             }
         }
         for i in 0..4 {
-            if virtual_temp <= CPU0_CLR[i] && state_cpu0 > i {
+            if virtual_temp_for_cpu <= CPU0_CLR[i] && state_cpu0 > i {
                 state_cpu0 = i;
                 let val = if i == 0 { CPU0_DEFAULT } else { CPU0_TARGET[i - 1] };
                 println!("[CPU0] Down -> L{} ({}Hz)", state_cpu0, val);
@@ -209,17 +271,17 @@ fn main() {
             }
         }
 
-        // ── CPU4 ──────────────────────────────────────────────────────────
+        // ── CPU4 (with proactive offset) ────────────────────────────────
         for i in (0..6).rev() {
-            if virtual_temp >= CPU4_TRIG[i] && state_cpu4 <= i {
+            if virtual_temp_for_cpu >= CPU4_TRIG[i] && state_cpu4 <= i {
                 state_cpu4 = i + 1;
-                println!("[CPU4] Up -> L{} ({}Hz)", state_cpu4, CPU4_TARGET[i]);
+                println!("[CPU4] Up -> L{} ({}Hz) [Proactive]", state_cpu4, CPU4_TARGET[i]);
                 write_opt!(node_cpu4, CPU4_TARGET[i]);
                 break;
             }
         }
         for i in 0..6 {
-            if virtual_temp <= CPU4_CLR[i] && state_cpu4 > i {
+            if virtual_temp_for_cpu <= CPU4_CLR[i] && state_cpu4 > i {
                 state_cpu4 = i;
                 let val = if i == 0 { CPU4_DEFAULT } else { CPU4_TARGET[i - 1] };
                 println!("[CPU4] Down -> L{} ({}Hz)", state_cpu4, val);
@@ -306,15 +368,18 @@ fn main() {
             write_opt!(node_wifi, 0);
         }
 
-        // ── Boost ─────────────────────────────────────────────────────────
-        if virtual_temp >= 48000 && state_boost == 0 {
-            state_boost = 1;
-            println!("[BOOST] Disabled");
-            write_opt!(node_boost, 0);
-        } else if virtual_temp <= 46000 && state_boost == 1 {
+        // ── WALT Input Boost (Proactive) ─────────────────────────────────
+        let should_disable_boost = (virtual_temp >= 48000) 
+            || (virtual_temp >= PROACTIVE_BOOST_TEMP_THRESHOLD && is_thermal_spike);
+
+        if should_disable_boost && state_boost == 1 {
             state_boost = 0;
-            println!("[BOOST] Re-enabled");
-            write_opt!(node_boost, 1);
+            println!("[BOOST] Proactive Disable (Rapid heat rise)");
+            write_str_opt!(node_walt_boost, BOOST_DISABLED_STR);
+        } else if !should_disable_boost && virtual_temp <= 46000 && state_boost == 0 {
+            state_boost = 1;
+            println!("[BOOST] Re-enabled WALT Input Boost");
+            write_str_opt!(node_walt_boost, BOOST_ENABLED_STR);
         }
 
         // ── Hotplug ──────────────────────────────────────────────────────
@@ -340,33 +405,42 @@ fn main() {
         write_opt!(node_cpu3_on, core_val);
         write_opt!(node_cpu6_on, core_val);
 
-        // ── Charging Control ─────────────────────────────────────────────
+        // ── Charging Control (Proactive) ─────────────────────────────────
         if screen_state == 1 {
             write_opt!(node_chg_limit, 0);
             write_opt!(node_res_chg, 1);
-            write_opt!(node_res_cur, if batt_temp >= 37 { 1000000 } else { 1500000 });
+            write_opt!(node_res_cur, if batt_temp >= 37 { 1500000 } else { 2000000 });
             restricted = false;
         } else {
             if prev_screen_state == 1 {
                 write_opt!(node_res_chg, 0);
-                write_opt!(node_res_cur, 1000000);
+                write_opt!(node_res_cur, 1500000);
                 restricted = false;
             }
 
-            if batt_temp >= 39 {
+            // Proactive charging restriction on thermal spike
+            if is_thermal_spike && batt_temp >= PROACTIVE_CHG_TEMP_THRESHOLD {
+                if !restricted {
+                    println!("[CHG] Proactive entry to restricted mode due to rate-of-change");
+                    restricted = true;
+                }
+                write_opt!(node_chg_limit, 0);
+                write_opt!(node_res_chg, 1);
+                write_opt!(node_res_cur, 1500000);
+            } else if batt_temp >= 39 {
                 if !restricted {
                     println!("[CHG] Battery temp >= 39°C: entering restricted mode");
                     restricted = true;
                 }
                 write_opt!(node_chg_limit, 0);
                 write_opt!(node_res_chg, 1);
-                write_opt!(node_res_cur, 1500000);
+                write_opt!(node_res_cur, 2000000);
             } else if restricted {
                 if batt_temp <= 35 {
                     println!("[CHG] Battery cooled to {}°C - exiting restricted mode", batt_temp);
                     restricted = false;
                     write_opt!(node_res_chg, 0);
-                    write_opt!(node_res_cur, 1000000);
+                    write_opt!(node_res_cur, 1500000);
                 } else {
                     write_opt!(node_chg_limit, 0);
                 }
@@ -374,7 +448,7 @@ fn main() {
 
             if !restricted {
                 write_opt!(node_res_chg, 0);
-                write_opt!(node_res_cur, 1000000);
+                write_opt!(node_res_cur, 1500000);
 
                 if (30..=38).contains(&batt_temp) {
                     write_opt!(node_chg_limit, batt_temp - 30);
@@ -387,9 +461,10 @@ fn main() {
 
         // ── Status ────────────────────────────────────────────────────────
         println!(
-            "V:{}°C | B:{}°C | C0:L{} C4:L{} G:L{} TS:L{} BL:{} W:{} Bs:{} HP:{}{} SOC:{}% R:{}",
+            "V:{}°C | B:{}°C | Δ:{:+.1}°C | C0:L{} C4:L{} G:L{} TS:L{} BL:{} W:{} Bs:{} HP:{}{} SOC:{}% R:{}",
             virtual_c,
             batt_temp,
+            temp_delta as f32 / 1000.0,
             state_cpu0,
             state_cpu4,
             state_gpu,
