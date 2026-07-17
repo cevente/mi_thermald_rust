@@ -1,6 +1,6 @@
 # mi_thermald
 
-mi_thermald is a high-performance, ML-optimized thermal and charging management daemon written in Rust for Android. It replaces standard thermal HALs to provide granular, efficient control over device temperatures, CPU frequency, GPU clocks, and battery charging limits.
+mi_thermald is a Rust-based thermal and charging management daemon for Android, reverse-engineered from Xiaomi's mi_thermald (decompiled in Ghidra) and tailored for sapphire/sapphiren devices. Unlike the original implementation, this version eliminates dependency on *.conf config files, instead embedding all thermal policies directly in the binary. It replaces standard thermal HALs to provide granular, efficient control over device temperatures, CPU frequency, GPU clocks, and battery charging limits.
 
 # Features
 
